@@ -146,22 +146,47 @@ func (n Node) Post(ctx context.Context, name, path string, body Traceable) ([]by
 		log.Error(3, "CLU failed to inject span into headers: %s", err)
 	}
 	req.Header.Add("Content-Type", "application/json")
-	rsp, err := client.Do(req)
-	if err != nil {
-		tags.Error.Set(span, true)
-		log.Error(3, "CLU Node: %s unreachable. %s", n.Name, err.Error())
-		return nil, NewError(http.StatusServiceUnavailable, fmt.Errorf("cluster node unavailable"))
+	c := make(chan struct {
+		r   *http.Response
+		err error
+	}, 1)
+	go func() {
+		rsp, err := client.Do(req)
+		c <- struct {
+			r   *http.Response
+			err error
+		}{rsp, err}
+	}()
+
+	// wait for either our results from the http request or if out context has been canceled
+	// then abort the http request.
+	select {
+	case <-ctx.Done():
+		log.Debug("CLU Node: context canceled. terminating request to peer %s", n.Name)
+		transport.CancelRequest(req)
+		<-c // Wait for client.Do
+	case resp := <-c:
+		err := resp.err
+		rsp := resp.r
+		if err != nil {
+			tags.Error.Set(span, true)
+			log.Error(3, "CLU Node: %s unreachable. %s", n.Name, err.Error())
+			return nil, NewError(http.StatusServiceUnavailable, fmt.Errorf("cluster node unavailable"))
+		}
+		out, err := handleResp(rsp)
+		if err != nil {
+			tags.Error.Set(span, true)
+		}
+		return out, err
 	}
-	out, err := handleResp(rsp)
-	if err != nil {
-		tags.Error.Set(span, true)
-	}
-	return out, err
+
+	return nil, nil
 }
 
 func handleResp(rsp *http.Response) ([]byte, error) {
 	defer rsp.Body.Close()
 	if rsp.StatusCode != 200 {
+		ioutil.ReadAll(rsp.Body)
 		return nil, NewError(rsp.StatusCode, fmt.Errorf(rsp.Status))
 	}
 	return ioutil.ReadAll(rsp.Body)
